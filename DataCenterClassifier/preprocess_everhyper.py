@@ -120,10 +120,28 @@ def detect_duplicate_tracts(dataframe: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+# Find feature columns that have no variation and should be removed before modeling.
+def find_constant_feature_columns(dataframe: pd.DataFrame) -> list[str]:
+    feature_columns = [
+        column
+        for column in dataframe.columns
+        if column not in [*ID_COLUMNS, "county_id", "tract_id", TARGET_COLUMN]
+    ]
+    return [column for column in feature_columns if dataframe[column].nunique(dropna=False) <= 1]
+
+
+# Remove constant feature columns while keeping IDs and the target intact.
+def drop_constant_feature_columns(dataframe: pd.DataFrame, constant_columns: list[str]) -> pd.DataFrame:
+    if not constant_columns:
+        return dataframe
+    return dataframe.drop(columns=constant_columns)
+
+
 # Summarize key dataset checks for later review in a JSON report.
 def build_validation_summary(
     dataframe: pd.DataFrame,
     coercion_failures: list[str],
+    constant_columns: list[str],
 ) -> dict:
     feature_columns = [
         column
@@ -131,16 +149,13 @@ def build_validation_summary(
         if column not in [*ID_COLUMNS, "county_id", "tract_id", TARGET_COLUMN]
     ]
     missing_counts = dataframe[feature_columns].isna().sum().sort_values(ascending=False)
-    constant_columns = [
-        column for column in feature_columns if dataframe[column].nunique(dropna=False) <= 1
-    ]
     duplicated_rows = int(dataframe.duplicated().sum())
     duplicated_tracts = int(dataframe["tract_id"].duplicated().sum())
 
     return {
         "row_count": int(len(dataframe)),
-        "column_count": int(len(dataframe.columns)),
-        "feature_count": int(len(feature_columns)),
+        "column_count_before_dropping_constants": int(len(dataframe.columns)),
+        "feature_count_before_dropping_constants": int(len(feature_columns)),
         "positive_count": int(dataframe[TARGET_COLUMN].sum()),
         "positive_rate": float(dataframe[TARGET_COLUMN].mean()),
         "county_count": int(dataframe["county_id"].nunique()),
@@ -148,7 +163,10 @@ def build_validation_summary(
         "duplicated_full_rows": duplicated_rows,
         "duplicated_tract_ids": duplicated_tracts,
         "numeric_coercion_failures": coercion_failures,
-        "constant_feature_columns": constant_columns,
+        "dropped_constant_feature_columns": constant_columns,
+        "dropped_constant_feature_count": int(len(constant_columns)),
+        "column_count_after_dropping_constants": int(len(dataframe.columns) - len(constant_columns)),
+        "feature_count_after_dropping_constants": int(len(feature_columns) - len(constant_columns)),
         "top_missing_features": [
             {
                 "column": column,
@@ -192,16 +210,18 @@ def main() -> None:
     dataframe = normalize_geography_codes(dataframe)
     dataframe = coerce_target(dataframe)
     dataframe, coercion_failures = coerce_numeric_features(dataframe)
-    validation_summary = build_validation_summary(dataframe, coercion_failures)
+    constant_columns = find_constant_feature_columns(dataframe)
+    validation_summary = build_validation_summary(dataframe, coercion_failures, constant_columns)
     validate_data(dataframe, coercion_failures)
-    save_outputs(dataframe, validation_summary, args.output, args.report)
+    cleaned_dataframe = drop_constant_feature_columns(dataframe, constant_columns)
+    save_outputs(cleaned_dataframe, validation_summary, args.output, args.report)
 
     print(f"Saved cleaned data to: {args.output}")
     print(f"Saved validation summary to: {args.report}")
     print(f"Rows: {validation_summary['row_count']:,}")
     print(f"Positive rate: {validation_summary['positive_rate']:.6f}")
     print(f"Counties: {validation_summary['county_count']:,}")
-    print(f"Constant feature columns: {len(validation_summary['constant_feature_columns'])}")
+    print(f"Dropped constant feature columns: {validation_summary['dropped_constant_feature_count']}")
 
 
 if __name__ == "__main__":
