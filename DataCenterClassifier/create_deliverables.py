@@ -5,8 +5,10 @@ import json
 import sys
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import pandas as pd
 from joblib import load
+from xgboost import DMatrix
 from xgboost import XGBClassifier
 
 # Allow importing shared utilities from the training script regardless of working directory.
@@ -54,6 +56,24 @@ def parse_args() -> argparse.Namespace:
         default="predicted_probability",
         help="Name of the appended final prediction column.",
     )
+    parser.add_argument(
+        "--shap-top-k",
+        type=int,
+        default=10,
+        help="Number of top features to include in SHAP plots.",
+    )
+    parser.add_argument(
+        "--shap-sample-rows",
+        type=int,
+        default=None,
+        help="Optional cap on rows used for SHAP computation (predictions still use all rows).",
+    )
+    parser.add_argument(
+        "--random-state",
+        type=int,
+        default=42,
+        help="Random seed used when sampling rows for SHAP.",
+    )
     return parser.parse_args()
 
 
@@ -77,14 +97,55 @@ def validate_feature_columns(dataframe: pd.DataFrame, feature_columns: list[str]
         )
 
 
+# Compute tree SHAP values from the fitted XGBoost model using pred_contribs.
+def compute_shap_values(model: XGBClassifier, model_input: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    raw_contribs = model.get_booster().predict(DMatrix(model_input), pred_contribs=True)
+    shap_values = pd.DataFrame(raw_contribs[:, :-1], columns=model_input.columns, index=model_input.index)
+    expected_value = pd.Series(raw_contribs[:, -1], index=model_input.index, name="expected_value")
+    return shap_values, expected_value
+
+
+# Save a bar plot for top-k features ranked by mean absolute SHAP value.
+def save_topk_bar_plot(mean_abs_shap: pd.Series, output_path: Path, top_k: int, variant: str) -> None:
+    top_features = mean_abs_shap.head(top_k).sort_values(ascending=True)
+    fig, axis = plt.subplots(figsize=(10, 6))
+    axis.barh(top_features.index, top_features.values)
+    axis.set_xlabel("Mean |SHAP value|")
+    axis.set_ylabel("Feature")
+    axis.set_title(f"{variant.capitalize()} model: Top {top_k} features by mean |SHAP|")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+# Save a distribution plot (boxplot) for signed SHAP values of top-k features.
+def save_topk_distribution_plot(
+    shap_values: pd.DataFrame,
+    top_features: list[str],
+    output_path: Path,
+    variant: str,
+) -> None:
+    distributions = [shap_values[feature].to_numpy() for feature in top_features]
+    fig, axis = plt.subplots(figsize=(11, 7))
+    axis.boxplot(distributions, vert=False, tick_labels=top_features, showfliers=False)
+    axis.axvline(0.0, color="black", linewidth=1)
+    axis.set_xlabel("SHAP value (impact on model output)")
+    axis.set_title(f"{variant.capitalize()} model: SHAP value distributions (top features)")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
 # Score one variant end to end and write a tract-level deliverable CSV plus metadata.
 def score_variant(
     dataframe: pd.DataFrame,
+    shap_dataframe: pd.DataFrame,
     variant: str,
     variant_dir: Path,
     output_dir: Path,
     prediction_column: str,
     input_path: Path,
+    top_k: int,
 ) -> Path:
     model, calibrator, calibration_method, feature_columns = load_variant_artifacts(variant_dir)
     validate_feature_columns(dataframe, feature_columns, variant)
@@ -112,6 +173,32 @@ def score_variant(
     output_file = variant_output_dir / f"{input_path.stem}_deliverable.csv"
     deliverable.to_csv(output_file, index=False)
 
+    # Compute and persist SHAP outputs for the same model inside the deliverables variant folder.
+    shap_model_input = shap_dataframe.loc[:, feature_columns]
+    shap_values, expected_value = compute_shap_values(model, shap_model_input)
+    mean_abs_shap = shap_values.abs().mean().sort_values(ascending=False)
+    top_features = mean_abs_shap.head(top_k).index.tolist()
+
+    shap_values_output = variant_output_dir / "shap_values.csv"
+    shap_values.to_csv(shap_values_output, index=False)
+
+    expected_output = variant_output_dir / "expected_value.csv"
+    expected_value.to_frame().to_csv(expected_output, index=False)
+
+    importance_output = variant_output_dir / "shap_feature_importance.csv"
+    mean_abs_shap.rename("mean_abs_shap").to_frame().to_csv(importance_output, index=True)
+
+    bar_plot_output = variant_output_dir / "shap_top10_bar.png"
+    save_topk_bar_plot(mean_abs_shap, bar_plot_output, top_k=top_k, variant=variant)
+
+    distribution_plot_output = variant_output_dir / "shap_top10_distribution.png"
+    save_topk_distribution_plot(
+        shap_values=shap_values,
+        top_features=top_features,
+        output_path=distribution_plot_output,
+        variant=variant,
+    )
+
     metadata = {
         "variant": variant,
         "input_path": str(input_path),
@@ -120,6 +207,16 @@ def score_variant(
         "prediction_column": prediction_column,
         "calibration_method": calibration_method,
         "output_file": str(output_file),
+        "shap": {
+            "row_count": int(len(shap_dataframe)),
+            "top_k": int(top_k),
+            "top_features": top_features,
+            "shap_values": str(shap_values_output),
+            "expected_value": str(expected_output),
+            "feature_importance": str(importance_output),
+            "topk_bar_plot": str(bar_plot_output),
+            "topk_distribution_plot": str(distribution_plot_output),
+        },
     }
     (variant_output_dir / "deliverable_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return output_file
@@ -132,6 +229,13 @@ def main() -> None:
     dataframe = read_modeling_data(args.input)
     validate_modeling_columns(dataframe)
 
+    shap_dataframe = dataframe
+    if args.shap_sample_rows is not None and args.shap_sample_rows < len(dataframe):
+        shap_dataframe = dataframe.sample(n=args.shap_sample_rows, random_state=args.random_state).sort_index()
+        print(f"Using SHAP sample rows: {len(shap_dataframe):,}")
+    else:
+        print(f"Using SHAP rows: {len(shap_dataframe):,}")
+
     output_paths = []
     for variant in ("constrained", "unconstrained"):
         variant_dir = args.models_dir / variant
@@ -140,11 +244,13 @@ def main() -> None:
 
         output_path = score_variant(
             dataframe=dataframe,
+            shap_dataframe=shap_dataframe,
             variant=variant,
             variant_dir=variant_dir,
             output_dir=args.output_dir,
             prediction_column=args.prediction_column,
             input_path=args.input,
+            top_k=args.shap_top_k,
         )
         output_paths.append(output_path)
         print(f"Saved {variant} deliverable to: {output_path}")
