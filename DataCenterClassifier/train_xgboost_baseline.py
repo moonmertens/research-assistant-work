@@ -58,6 +58,14 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for grouped splitting and model training.",
     )
+    parser.add_argument(
+        "--tuned-params-dir",
+        type=Path,
+        default=None,
+        help="Directory containing best_params_constrained.json and best_params_unconstrained.json "
+             "produced by tune_xgboost.py. When provided, these params override the hardcoded "
+             "hyperparameters for the corresponding model variant.",
+    )
     return parser.parse_args()
 
 
@@ -163,19 +171,29 @@ MONOTONIC_CONSTRAINTS = {
 
 
 # Build a baseline XGBoost classifier tuned for sparse positive outcomes.
-def build_model(scale_pos_weight: float, random_state: int, use_constraints: bool = True) -> XGBClassifier:
+# When `params` is provided (e.g. from tune_xgboost.py) it overrides the hardcoded defaults.
+def build_model(
+    scale_pos_weight: float,
+    random_state: int,
+    use_constraints: bool = True,
+    params: dict | None = None,
+) -> XGBClassifier:
+    base_params: dict = {
+        "n_estimators": 2000,
+        "learning_rate": 0.03,
+        "max_depth": 4,
+        "min_child_weight": 5,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+        "gamma": 0.0,
+    }
+    if params is not None:
+        base_params.update(params)
     return XGBClassifier(
         objective="binary:logistic",
         eval_metric=["aucpr", "logloss"],
-        n_estimators=2000,
-        learning_rate=0.03,
-        max_depth=4,
-        min_child_weight=5,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        gamma=0.0,
         tree_method="hist",
         missing=float("nan"),
         scale_pos_weight=scale_pos_weight,
@@ -183,6 +201,7 @@ def build_model(scale_pos_weight: float, random_state: int, use_constraints: boo
         n_jobs=-1,
         early_stopping_rounds=50,
         monotone_constraints=MONOTONIC_CONSTRAINTS if use_constraints else {},
+        **base_params,
     )
 
 
@@ -243,6 +262,7 @@ def fit_model(
     validation_size: float,
     random_state: int,
     use_constraints: bool = True,
+    params: dict | None = None,
 ) -> tuple[XGBClassifier, dict[str, pd.DataFrame | pd.Series | float | int | dict[str, int | str | None]]]:
     fit_index, validation_index, validation_split_metadata = make_stratified_grouped_split(
         train_groups,
@@ -256,7 +276,7 @@ def fit_model(
     x_validation = x_train.loc[validation_index]
     y_validation = y_train.loc[validation_index]
 
-    model = build_model(compute_scale_pos_weight(y_fit), random_state=random_state, use_constraints=use_constraints)
+    model = build_model(compute_scale_pos_weight(y_fit), random_state=random_state, use_constraints=use_constraints, params=params)
     model.fit(
         x_fit,
         y_fit,
@@ -361,6 +381,7 @@ def run_variant(
     random_state: int,
     test_split_metadata: dict,
     input_path: Path,
+    params: dict | None = None,
 ) -> None:
     print(f"\n--- Training {label} model ---")
 
@@ -371,6 +392,7 @@ def run_variant(
         validation_size=validation_size,
         random_state=random_state,
         use_constraints=use_constraints,
+        params=params,
     )
 
     validation_uncalibrated_probabilities, validation_uncalibrated_metrics = score_uncalibrated_partition(
@@ -413,6 +435,7 @@ def run_variant(
         "input_path": str(input_path),
         "monotonic_constraints_applied": use_constraints,
         "monotonic_constraints": MONOTONIC_CONSTRAINTS if use_constraints else {},
+        "tuned_params": params,
         "feature_count": len(x_train.columns),
         "train_row_count": len(x_train),
         "validation_row_count": len(split_details["x_validation"]),
@@ -499,8 +522,23 @@ def main() -> None:
         input_path=args.input,
     )
 
-    run_variant("constrained",   use_constraints=True,  output_dir=base_dir / "constrained",   **shared)
-    run_variant("unconstrained", use_constraints=False, output_dir=base_dir / "unconstrained", **shared)
+    # Load Optuna-tuned hyperparameters if a tuning output directory is provided.
+    tuned_params: dict[str, dict | None] = {"constrained": None, "unconstrained": None}
+    if args.tuned_params_dir is not None:
+        for _label in ("constrained", "unconstrained"):
+            _params_path = args.tuned_params_dir / f"best_params_{_label}.json"
+            if _params_path.exists():
+                _result = json.loads(_params_path.read_text(encoding="utf-8"))
+                tuned_params[_label] = _result["best_params"]
+                print(
+                    f"Loaded tuned params for {_label} "
+                    f"(validation PR AUC {_result['best_validation_pr_auc']:.6f})"
+                )
+            else:
+                print(f"Warning: tuned params not found for {_label} at {_params_path}; using defaults.")
+
+    run_variant("constrained",   use_constraints=True,  output_dir=base_dir / "constrained",   params=tuned_params["constrained"],   **shared)
+    run_variant("unconstrained", use_constraints=False, output_dir=base_dir / "unconstrained", params=tuned_params["unconstrained"], **shared)
 
 
 if __name__ == "__main__":
