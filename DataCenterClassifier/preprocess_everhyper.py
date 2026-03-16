@@ -39,7 +39,38 @@ def parse_args() -> argparse.Namespace:
         default=data_dir / OUTPUT_REPORT_NAME,
         help="Path to the validation report JSON.",
     )
+    parser.add_argument(
+        "--disable-winsorization",
+        action="store_true",
+        help="Disable winsorization of numeric features.",
+    )
+    parser.add_argument(
+        "--winsor-lower-quantile",
+        type=float,
+        default=0.01,
+        help="Lower quantile used for winsorization (default: 0.01).",
+    )
+    parser.add_argument(
+        "--winsor-upper-quantile",
+        type=float,
+        default=0.99,
+        help="Upper quantile used for winsorization (default: 0.99).",
+    )
     return parser.parse_args()
+
+
+# Validate winsorization settings before transformations begin.
+def validate_preprocessing_options(args: argparse.Namespace) -> None:
+    if args.disable_winsorization:
+        return
+
+    lower = args.winsor_lower_quantile
+    upper = args.winsor_upper_quantile
+    if not (0.0 <= lower < upper <= 1.0):
+        raise ValueError(
+            "Winsor quantiles must satisfy 0.0 <= lower < upper <= 1.0. "
+            f"Received lower={lower}, upper={upper}."
+        )
 
 
 # Standardize raw column names and fail if cleaning creates duplicates.
@@ -112,6 +143,61 @@ def coerce_numeric_features(dataframe: pd.DataFrame) -> tuple[pd.DataFrame, list
     return normalized, coercion_failures
 
 
+# Return numeric feature columns used for outlier management.
+def get_feature_columns(dataframe: pd.DataFrame) -> list[str]:
+    return [
+        column
+        for column in dataframe.columns
+        if column not in [*ID_COLUMNS, "county_id", "tract_id", TARGET_COLUMN]
+    ]
+
+
+# Cap extreme values per feature using lower and upper quantile thresholds.
+def winsorize_features(
+    dataframe: pd.DataFrame,
+    lower_quantile: float,
+    upper_quantile: float,
+) -> tuple[pd.DataFrame, dict]:
+    transformed = dataframe.copy()
+    feature_columns = get_feature_columns(transformed)
+
+    clipped_feature_count = 0
+    clipped_value_count = 0
+    feature_bounds: dict[str, dict[str, float]] = {}
+
+    for column in feature_columns:
+        series = transformed[column]
+        non_missing = series.dropna()
+        if non_missing.empty:
+            continue
+
+        lower_bound = float(non_missing.quantile(lower_quantile))
+        upper_bound = float(non_missing.quantile(upper_quantile))
+        clipped = series.clip(lower=lower_bound, upper=upper_bound)
+        changed = ((series < lower_bound) | (series > upper_bound)).fillna(False)
+        changed_count = int(changed.sum())
+
+        transformed[column] = clipped
+        feature_bounds[column] = {
+            "lower_bound": lower_bound,
+            "upper_bound": upper_bound,
+        }
+
+        if changed_count > 0:
+            clipped_feature_count += 1
+            clipped_value_count += changed_count
+
+    metadata = {
+        "applied": True,
+        "lower_quantile": float(lower_quantile),
+        "upper_quantile": float(upper_quantile),
+        "clipped_feature_count": clipped_feature_count,
+        "clipped_value_count": clipped_value_count,
+        "feature_bounds": feature_bounds,
+    }
+    return transformed, metadata
+
+
 # Identify repeated tract IDs so they can be surfaced as a hard validation error.
 def detect_duplicate_tracts(dataframe: pd.DataFrame) -> pd.DataFrame:
     duplicate_mask = dataframe.duplicated(subset=["tract_id"], keep=False)
@@ -122,11 +208,7 @@ def detect_duplicate_tracts(dataframe: pd.DataFrame) -> pd.DataFrame:
 
 # Find feature columns that have no variation and should be removed before modeling.
 def find_constant_feature_columns(dataframe: pd.DataFrame) -> list[str]:
-    feature_columns = [
-        column
-        for column in dataframe.columns
-        if column not in [*ID_COLUMNS, "county_id", "tract_id", TARGET_COLUMN]
-    ]
+    feature_columns = get_feature_columns(dataframe)
     return [column for column in feature_columns if dataframe[column].nunique(dropna=False) <= 1]
 
 
@@ -142,12 +224,9 @@ def build_validation_summary(
     dataframe: pd.DataFrame,
     coercion_failures: list[str],
     constant_columns: list[str],
+    winsorization_metadata: dict,
 ) -> dict:
-    feature_columns = [
-        column
-        for column in dataframe.columns
-        if column not in [*ID_COLUMNS, "county_id", "tract_id", TARGET_COLUMN]
-    ]
+    feature_columns = get_feature_columns(dataframe)
     missing_counts = dataframe[feature_columns].isna().sum().sort_values(ascending=False)
     duplicated_rows = int(dataframe.duplicated().sum())
     duplicated_tracts = int(dataframe["tract_id"].duplicated().sum())
@@ -167,6 +246,7 @@ def build_validation_summary(
         "dropped_constant_feature_count": int(len(constant_columns)),
         "column_count_after_dropping_constants": int(len(dataframe.columns) - len(constant_columns)),
         "feature_count_after_dropping_constants": int(len(feature_columns) - len(constant_columns)),
+        "winsorization": winsorization_metadata,
         "top_missing_features": [
             {
                 "column": column,
@@ -204,14 +284,37 @@ def save_outputs(dataframe: pd.DataFrame, report: dict, output_path: Path, repor
 # Run the full preprocessing pipeline from raw input to saved outputs.
 def main() -> None:
     args = parse_args()
+    validate_preprocessing_options(args)
 
     dataframe = read_raw_data(args.input)
     validate_required_columns(dataframe)
     dataframe = normalize_geography_codes(dataframe)
     dataframe = coerce_target(dataframe)
     dataframe, coercion_failures = coerce_numeric_features(dataframe)
+
+    if args.disable_winsorization:
+        winsorization_metadata = {
+            "applied": False,
+            "lower_quantile": float(args.winsor_lower_quantile),
+            "upper_quantile": float(args.winsor_upper_quantile),
+            "clipped_feature_count": 0,
+            "clipped_value_count": 0,
+            "feature_bounds": {},
+        }
+    else:
+        dataframe, winsorization_metadata = winsorize_features(
+            dataframe,
+            lower_quantile=args.winsor_lower_quantile,
+            upper_quantile=args.winsor_upper_quantile,
+        )
+
     constant_columns = find_constant_feature_columns(dataframe)
-    validation_summary = build_validation_summary(dataframe, coercion_failures, constant_columns)
+    validation_summary = build_validation_summary(
+        dataframe,
+        coercion_failures,
+        constant_columns,
+        winsorization_metadata,
+    )
     validate_data(dataframe, coercion_failures)
     cleaned_dataframe = drop_constant_feature_columns(dataframe, constant_columns)
     save_outputs(cleaned_dataframe, validation_summary, args.output, args.report)
@@ -222,6 +325,13 @@ def main() -> None:
     print(f"Positive rate: {validation_summary['positive_rate']:.6f}")
     print(f"Counties: {validation_summary['county_count']:,}")
     print(f"Dropped constant feature columns: {validation_summary['dropped_constant_feature_count']}")
+    winsorization_label = (
+        "disabled"
+        if args.disable_winsorization
+        else f"q{args.winsor_lower_quantile:.2f}-q{args.winsor_upper_quantile:.2f}"
+    )
+    print(f"Winsorization: {winsorization_label}")
+
 
 
 if __name__ == "__main__":
