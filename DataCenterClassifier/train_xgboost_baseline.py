@@ -144,8 +144,26 @@ def compute_scale_pos_weight(target: pd.Series) -> float:
     return negative_count / positive_count
 
 
+# Monotonic constraints grounded in hyperscale data center site economics.
+# +1: higher values strictly increase siting likelihood.
+# -1: higher values strictly decrease siting likelihood.
+MONOTONIC_CONSTRAINTS = {
+    # Power infrastructure — more capacity is always strictly better.
+    "substation_avg_voltage_kv20": 1,
+    "transmission_hv_km25": 1,
+    # Connectivity — fiber is a hard operational requirement.
+    "fiber_fiber_km25": 1,
+    # Operating cost — industrial electricity price directly compresses margin.
+    "electricity_wave_price_industria": -1,
+    # Operational risk — FEMA disaster declarations threaten five-nines uptime.
+    "disaster_totaldeclare": -1,
+    # Regulatory risk — EPA non-attainment blocks backup-generator air permits.
+    "envirreg_nonatt_any": -1,
+}
+
+
 # Build a baseline XGBoost classifier tuned for sparse positive outcomes.
-def build_model(scale_pos_weight: float, random_state: int) -> XGBClassifier:
+def build_model(scale_pos_weight: float, random_state: int, use_constraints: bool = True) -> XGBClassifier:
     return XGBClassifier(
         objective="binary:logistic",
         eval_metric=["aucpr", "logloss"],
@@ -164,6 +182,7 @@ def build_model(scale_pos_weight: float, random_state: int) -> XGBClassifier:
         random_state=random_state,
         n_jobs=-1,
         early_stopping_rounds=50,
+        monotone_constraints=MONOTONIC_CONSTRAINTS if use_constraints else {},
     )
 
 
@@ -223,6 +242,7 @@ def fit_model(
     train_groups: pd.Series,
     validation_size: float,
     random_state: int,
+    use_constraints: bool = True,
 ) -> tuple[XGBClassifier, dict[str, pd.DataFrame | pd.Series | float | int | dict[str, int | str | None]]]:
     fit_index, validation_index, validation_split_metadata = make_stratified_grouped_split(
         train_groups,
@@ -236,7 +256,7 @@ def fit_model(
     x_validation = x_train.loc[validation_index]
     y_validation = y_train.loc[validation_index]
 
-    model = build_model(compute_scale_pos_weight(y_fit), random_state=random_state)
+    model = build_model(compute_scale_pos_weight(y_fit), random_state=random_state, use_constraints=use_constraints)
     model.fit(
         x_fit,
         y_fit,
@@ -324,44 +344,35 @@ def save_outputs(
     validation_predictions.to_csv(output_dir / "validation_predictions.csv", index=False)
 
 
-# End-to-end training workflow.
-# Run the full baseline training workflow and persist the outputs.
-def main() -> None:
-    args = parse_args()
+# Train one model variant and save all outputs to the given directory.
+def run_variant(
+    label: str,
+    use_constraints: bool,
+    output_dir: Path,
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    groups_train: pd.Series,
+    x_test: pd.DataFrame,
+    y_test: pd.Series,
+    groups_test: pd.Series,
+    ids_train: pd.DataFrame,
+    ids_test: pd.DataFrame,
+    validation_size: float,
+    random_state: int,
+    test_split_metadata: dict,
+    input_path: Path,
+) -> None:
+    print(f"\n--- Training {label} model ---")
 
-    # Load the prepared tract-level data and assemble modeling inputs.
-    dataframe = read_modeling_data(args.input)
-    validate_modeling_columns(dataframe)
-    x, y, groups, ids = build_modeling_matrices(dataframe)
-
-    # Create the held-out county test split.
-    train_index, test_index, test_split_metadata = make_stratified_grouped_split(
-        groups,
-        y,
-        holdout_size=args.test_size,
-        random_state=args.random_state,
-    )
-
-    x_train = x.loc[train_index]
-    y_train = y.loc[train_index]
-    groups_train = groups.loc[train_index]
-    ids_train = ids.loc[train_index]
-
-    x_test = x.loc[test_index]
-    y_test = y.loc[test_index]
-    groups_test = groups.loc[test_index]
-    ids_test = ids.loc[test_index]
-
-    # Train the model on the training counties and reserve inner validation counties.
     model, split_details = fit_model(
         x_train,
         y_train,
         groups_train,
-        validation_size=args.validation_size,
-        random_state=args.random_state,
+        validation_size=validation_size,
+        random_state=random_state,
+        use_constraints=use_constraints,
     )
 
-    # Score the validation fold, then fit and apply a probability calibrator.
     validation_uncalibrated_probabilities, validation_uncalibrated_metrics = score_uncalibrated_partition(
         model,
         split_details["x_validation"],
@@ -390,7 +401,6 @@ def main() -> None:
     )
     test_calibrated_metrics = compute_probability_metrics(y_test, test_calibrated_probabilities)
 
-    # Combine identifiers with predicted probabilities for export.
     validation_predictions = ids_train.loc[split_details["x_validation"].index].copy()
     validation_predictions["uncalibrated_probability"] = validation_uncalibrated_probabilities.values
     validation_predictions["calibrated_probability"] = validation_calibrated_probabilities.values
@@ -399,10 +409,11 @@ def main() -> None:
     test_predictions["uncalibrated_probability"] = test_uncalibrated_probabilities.values
     test_predictions["calibrated_probability"] = test_calibrated_probabilities.values
 
-    # Collect run metadata, performance metrics, and decile summaries.
     metrics_payload = {
-        "input_path": str(args.input),
-        "feature_count": len(x.columns),
+        "input_path": str(input_path),
+        "monotonic_constraints_applied": use_constraints,
+        "monotonic_constraints": MONOTONIC_CONSTRAINTS if use_constraints else {},
+        "feature_count": len(x_train.columns),
         "train_row_count": len(x_train),
         "validation_row_count": len(split_details["x_validation"]),
         "test_row_count": len(x_test),
@@ -422,28 +433,74 @@ def main() -> None:
         "test_deciles_calibrated": build_decile_summary(test_calibrated_probabilities, y_test),
     }
 
-    # Persist all artifacts needed for review and reuse.
     save_outputs(
-        output_dir=args.output_dir,
+        output_dir=output_dir,
         model=model,
         calibrator=calibrator,
         calibration_method=calibration_method,
-        feature_columns=x.columns.tolist(),
+        feature_columns=x_train.columns.tolist(),
         metrics_payload=metrics_payload,
         test_predictions=test_predictions,
         validation_predictions=validation_predictions,
     )
 
-    print(f"Saved outputs to: {args.output_dir}")
-    print(f"Features used: {len(x.columns)}")
-    print(f"Train rows: {len(x_train):,}")
-    print(f"Validation rows: {len(split_details['x_validation']):,}")
-    print(f"Test rows: {len(x_test):,}")
+    print(f"Saved outputs to: {output_dir}")
     print(f"Calibration method: {calibration_method}")
-    print(f"Test PR AUC (uncalibrated): {test_uncalibrated_metrics['pr_auc']:.6f}")
+    print(f"Test PR AUC (uncalibrated):  {test_uncalibrated_metrics['pr_auc']:.6f}")
     print(f"Test ROC AUC (uncalibrated): {test_uncalibrated_metrics['roc_auc']:.6f}")
-    print(f"Test Brier score (uncalibrated): {test_uncalibrated_metrics['brier_score']:.6f}")
     print(f"Test Brier score (calibrated): {test_calibrated_metrics['brier_score']:.6f}")
+
+
+# End-to-end training workflow.
+# Run constrained and unconstrained variants and persist both sets of outputs.
+def main() -> None:
+    args = parse_args()
+    base_dir = args.output_dir.parent
+
+    # Load the prepared tract-level data and assemble modeling inputs.
+    dataframe = read_modeling_data(args.input)
+    validate_modeling_columns(dataframe)
+    x, y, groups, ids = build_modeling_matrices(dataframe)
+
+    print(f"Features used: {len(x.columns)}")
+
+    # Create the held-out county test split once, shared by both variants.
+    train_index, test_index, test_split_metadata = make_stratified_grouped_split(
+        groups,
+        y,
+        holdout_size=args.test_size,
+        random_state=args.random_state,
+    )
+
+    x_train = x.loc[train_index]
+    y_train = y.loc[train_index]
+    groups_train = groups.loc[train_index]
+    ids_train = ids.loc[train_index]
+
+    x_test = x.loc[test_index]
+    y_test = y.loc[test_index]
+    groups_test = groups.loc[test_index]
+    ids_test = ids.loc[test_index]
+
+    print(f"Train rows: {len(x_train):,}  |  Test rows: {len(x_test):,}")
+
+    shared = dict(
+        x_train=x_train,
+        y_train=y_train,
+        groups_train=groups_train,
+        x_test=x_test,
+        y_test=y_test,
+        groups_test=groups_test,
+        ids_train=ids_train,
+        ids_test=ids_test,
+        validation_size=args.validation_size,
+        random_state=args.random_state,
+        test_split_metadata=test_split_metadata,
+        input_path=args.input,
+    )
+
+    run_variant("constrained",   use_constraints=True,  output_dir=base_dir / "constrained",   **shared)
+    run_variant("unconstrained", use_constraints=False, output_dir=base_dir / "unconstrained", **shared)
 
 
 if __name__ == "__main__":
